@@ -1,0 +1,430 @@
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 222855cc0158..cc70db232d3d 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -754,6 +754,20 @@ menuconfig HYPERVISOR_GUEST
+ 
+ if HYPERVISOR_GUEST
+ 
++config HBTE
++        bool "Enable Hypervisor-provided Boot-Time Entropy"
++        default y
++        ---help---
++          This option enables the HBTE/E-BOOT feature that allows hypervisors to provide
++          high-quality randomness to guest kernels through a pre-reserved memory area.
++          This randomness can be used at the earliest stages of the boot process to satisfy the
++          entropy demand of kernel components requiring high-quality entropy (e.g., to initialize
++          the CSPRNG). This feature is particularly designed to overcome the boot-time entropy
++          starvation problem in virtualized environments, which can produce potential security
++          risks and long delays in the startup of some userland applications.
++
++          If unsure, say N.
++
+ config PARAVIRT
+ 	bool "Enable paravirtualization code"
+ 	---help---
+diff --git a/arch/x86/boot/compressed/kaslr.c b/arch/x86/boot/compressed/kaslr.c
+index 2e53c056ba20..4ad0f0aec29c 100644
+--- a/arch/x86/boot/compressed/kaslr.c
++++ b/arch/x86/boot/compressed/kaslr.c
+@@ -73,15 +73,26 @@ static unsigned long rotate_xor(unsigned long hash, const void *area,
+ 	return hash;
+ }
+ 
++#ifdef CONFIG_HBTE
++extern unsigned long hbte_seed_kaslr_paddr, hbte_seed_kaslr_vaddr;
++#endif
++
+ /* Attempt to create a simple but unpredictable starting entropy. */
+ static unsigned long get_boot_seed(void)
+ {
+ 	unsigned long hash = 0;
++        static int i = 0;
+ 
+ 	hash = rotate_xor(hash, build_str, sizeof(build_str));
+ 	hash = rotate_xor(hash, boot_params, sizeof(*boot_params));
+ 
++#ifdef CONFIG_HBTE
++        // PoC using the provided entropy for KASLR
++        if (!i++) return hash ^ hbte_seed_kaslr_paddr; // 1st call
++        else      return hash ^ hbte_seed_kaslr_vaddr; // 2nd call
++#else
+ 	return hash;
++#endif
+ }
+ 
+ #define KASLR_COMPRESSED_BOOT
+diff --git a/arch/x86/boot/compressed/misc.c b/arch/x86/boot/compressed/misc.c
+index 53ac0cb2396d..93ed9cae0b12 100644
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@ -19,6 +19,21 @@
+ #include "../voffset.h"
+ #include <asm/bootparam_utils.h>
+ 
++#ifdef CONFIG_HBTE
++#define HBTE_COMPRESSED_BOOT
++#include <asm/hbte.h>
++#endif
++
++#ifdef CONFIG_X86_64
++#define Elf_Ehdr Elf64_Ehdr
++#define Elf_Phdr Elf64_Phdr
++#define Elf_Shdr Elf64_Shdr
++#else
++#define Elf_Ehdr Elf32_Ehdr
++#define Elf_Phdr Elf32_Phdr
++#define Elf_Shdr Elf32_Shdr
++#endif
++
+ /*
+  * WARNING!!
+  * This code is compiled with -fPIC and it is relocated dynamically at
+@@ -39,6 +54,17 @@
+ #define memzero(s, n)	memset((s), 0, (n))
+ #define memmove		memmove
+ 
++/*
++ * HBTE/E-BOOT pre-reserved area containing randomness filled by the hypervisor.
++ */
++#ifdef CONFIG_HBTE
++struct hbte_rnd hbte_rnd __section(.hbte.rnd) = {
++        .magic = HBTE_MAGIC_NUMBER,
++        .payload = {},
++};
++unsigned long hbte_seed_kaslr_paddr, hbte_seed_kaslr_vaddr;
++#endif
++
+ /* Functions used by the included decompressor code below. */
+ void *memmove(void *dest, const void *src, size_t n);
+ 
+@@ -267,6 +293,104 @@ static inline void handle_relocations(void *output, unsigned long output_len,
+ { }
+ #endif
+ 
++#ifdef CONFIG_HBTE
++static void decompressor_hbte(struct hbte_rnd *hbte_rnd)
++{
++        // Check magic number
++        if (HBTE_MAGIC_NUMBER != hbte_rnd->magic) {
++                error("[DEBUG] HBTE/E-BOOT: Incorrect magic number\n");
++        }
++
++        // Check payload size
++        if (BOOT_TIME_ENTROPY_SIZE < hbte_rnd->len) {
++                error("[DEBUG] HBTE/E-BOOT: Length field greater than payload size\n");
++        }
++
++        if (!hbte_rnd->len) {
++                error("[DEBUG] HBTE/E-BOOT: Empty payload\n");
++        }
++
++        // Check if there is enough entropy
++        // For this PoC, KASLR needs 2*sizeof(unsigned long)
++        if (hbte_rnd->len < (2 * sizeof(hbte_seed_kaslr_vaddr))) {
++                error("[DEBUG] HBTE/E-BOOT: Not enough entropy in payload\n");
++        }
++
++        // Start consuming entropy from the end to the start of the payload buffer
++        hbte_rnd->len -= sizeof(hbte_seed_kaslr_paddr);
++        memcpy(
++                &hbte_seed_kaslr_paddr,
++                hbte_rnd->payload + hbte_rnd->len,
++                sizeof(hbte_seed_kaslr_paddr)
++        );
++
++        hbte_rnd->len -= sizeof(hbte_seed_kaslr_vaddr);
++        memcpy(
++                &hbte_seed_kaslr_vaddr,
++                hbte_rnd->payload + hbte_rnd->len,
++                sizeof(hbte_seed_kaslr_vaddr)
++        );
++}
++
++static void hbte_copy_rnd(void *output, Elf_Shdr *shdr)
++{
++        struct hbte_rnd *kernel_hbte;
++        unsigned long kernel_payload_size;
++
++        // ELF src physical addr: output + shdr->sh_offset
++        kernel_hbte = (void *)(
++                ((unsigned long) output) + (shdr->sh_addr - VO__text)
++        );
++
++        // Check magic number
++        if (HBTE_MAGIC_NUMBER != kernel_hbte->magic) {
++                debug_putstr("[DEBUG] HBTE/E-BOOT (kernel): Incorrect magic number\n");
++                // TODO: BUG()
++                return;
++        }
++
++        kernel_payload_size = hbte_rnd.len;    // remaining entropy
++
++        // Transfer the remaining entropy to the kernel
++        memcpy(kernel_hbte->payload, hbte_rnd.payload, kernel_payload_size);
++
++        // Update the length field
++        kernel_hbte->len = kernel_payload_size;
++}
++
++static void parse_section_headers(void *output, Elf_Ehdr *ehdr)
++{
++        Elf_Shdr *shdrs, *shdr;
++        const char *sname;
++        int i;
++
++        debug_putstr("Parsing ELF sections...\n");
++
++        shdrs = (Elf_Shdr *)(output + ehdr->e_shoff);
++
++        Elf64_Shdr *sh_strtab = &shdrs[ehdr->e_shstrndx];
++        const char *const sh_strtab_ptr = output + sh_strtab->sh_offset;
++
++        for (i = 0; i < ehdr->e_shnum; i++) {
++                shdr = &shdrs[i];
++
++                switch (shdr->sh_type) {
++                case SHT_PROGBITS:
++                        sname = sh_strtab_ptr + shdr->sh_name;
++
++                        if (!strcmp(sname, ".hbte.rnd")) {
++                                // Transfer remaining entropy to the kernel
++                                hbte_copy_rnd(output, shdr);
++                                return;
++                        }
++
++                default: // Ignore other SHT_ //
++                        break;
++                }
++        }
++}
++#endif /* CONFIG_HBTE */
++
+ static void parse_elf(void *output)
+ {
+ #ifdef CONFIG_X86_64
+@@ -317,6 +441,11 @@ static void parse_elf(void *output)
+ 		}
+ 	}
+ 
++#ifdef CONFIG_HBTE
++        // After PT_LOAD segments are loaded into their corresponding physical address
++        parse_section_headers(output, &ehdr);
++#endif
++
+ 	free(phdrs);
+ }
+ 
+@@ -391,6 +520,20 @@ asmlinkage __visible void *extract_kernel(void *rmode, memptr heap,
+ 	debug_putaddr(trampoline_32bit);
+ #endif
+ 
++#ifdef CONFIG_HBTE
++        // XXX WARNING XXX
++        hbte_rnd.len = 32; /// XXX: This is only for debugging!!
++        /* 
++         * Simulating that the hypervisor put there 32 bytes
++         * It will actually credit the NULL entropy if the hypervisor
++         * does not support e-boot, and we don't want that!
++         * This is done for debugging purposes, to check that
++         * the PoC is working as expected.
++         */
++
++        decompressor_hbte(&hbte_rnd);
++#endif
++
+ 	/*
+ 	 * The memory hole needed for the kernel is the larger of either
+ 	 * the entire decompressed kernel plus relocation table, or the
+diff --git a/arch/x86/boot/compressed/vmlinux.lds.S b/arch/x86/boot/compressed/vmlinux.lds.S
+index 508cfa6828c5..31f3ccc869b1 100644
+--- a/arch/x86/boot/compressed/vmlinux.lds.S
++++ b/arch/x86/boot/compressed/vmlinux.lds.S
+@@ -54,6 +54,15 @@ SECTIONS
+ 		*(.data.*)
+ 		_edata = . ;
+ 	}
++
++#ifdef CONFIG_HBTE
++        . = ALIGN(4);
++        // Before NOBITS sections
++        .hbte.rnd : {
++                *(.hbte.rnd)
++        }
++#endif
++
+ 	. = ALIGN(L1_CACHE_BYTES);
+ 	.bss : {
+ 		_bss = . ;
+diff --git a/arch/x86/include/asm/hbte.h b/arch/x86/include/asm/hbte.h
+new file mode 100644
+index 000000000000..52e95d806fc5
+--- /dev/null
++++ b/arch/x86/include/asm/hbte.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_BOOT_TIME_ENTROPY_H_
++#define _ASM_BOOT_TIME_ENTROPY_H_
++
++#define HBTE_MAGIC_NUMBER               (0x8b7e)
++
++#ifndef HBTE_COMPRESSED_BOOT
++#define BOOT_TIME_ENTROPY_SIZE          (16)
++#else
++#define BOOT_TIME_ENTROPY_SIZE          (2 * 16)
++#endif
++
++struct hbte_rnd {
++        unsigned short magic;
++        unsigned char flags;
++        unsigned char len;
++        unsigned char payload[BOOT_TIME_ENTROPY_SIZE];
++} __attribute__((packed));
++
++#endif
++
+diff --git a/arch/x86/kernel/vmlinux.lds.S b/arch/x86/kernel/vmlinux.lds.S
+index e2feacf921a0..502ec74666ad 100644
+--- a/arch/x86/kernel/vmlinux.lds.S
++++ b/arch/x86/kernel/vmlinux.lds.S
+@@ -332,6 +332,13 @@ SECTIONS
+ 	PERCPU_SECTION(INTERNODE_CACHE_BYTES)
+ #endif
+ 
++#ifdef CONFIG_HBTE
++        . = ALIGN(4);
++        .hbte.rnd : AT(ADDR(.hbte.rnd) - LOAD_OFFSET) {
++                *(.hbte.rnd)
++        }
++#endif
++
+ 	. = ALIGN(PAGE_SIZE);
+ 
+ 	/* freed after init ends here */
+diff --git a/drivers/char/random.c b/drivers/char/random.c
+index 5d5ea4ce1442..d055f5128101 100644
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@ -342,6 +342,10 @@
+ #include <asm/irq_regs.h>
+ #include <asm/io.h>
+ 
++#ifdef CONFIG_HBTE
++#include <asm/hbte.h>
++#endif
++
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/random.h>
+ 
+@@ -1166,6 +1170,44 @@ struct timer_rand_state {
+ 
+ #define INIT_TIMER_RAND_STATE { INITIAL_JIFFIES, };
+ 
++#ifdef CONFIG_HBTE
++void add_boot_time_entropy(struct hbte_rnd *hbte_rnd)
++{
++        unsigned long nbytes;
++
++        // Check magic number
++        if (HBTE_MAGIC_NUMBER != hbte_rnd->magic) {
++                printk(KERN_DEBUG "HBTE/E-BOOT: Incorrect magic number\n");
++                // TODO: BUG()
++                return;
++        }
++
++        // Check payload size
++        if (BOOT_TIME_ENTROPY_SIZE < hbte_rnd->len) {
++                printk(KERN_DEBUG "HBTE/E-BOOT: Length field greater than payload size\n");
++                // TODO: BUG()
++                return;
++        }
++
++        if (!hbte_rnd->len) {
++                printk(KERN_DEBUG "HBTE/E-BOOT: Empty payload. Ignoring.\n");
++                return;
++        }
++
++        // Avoid copying more than the size of input_pool_data
++        nbytes = min(
++                (unsigned long)hbte_rnd->len,
++                (ARRAY_SIZE(input_pool_data) * sizeof(*input_pool_data))
++        );
++
++        mix_pool_bytes(&input_pool, hbte_rnd->payload, nbytes);
++        credit_entropy_bits(&input_pool, 8 * nbytes);
++        printk(KERN_DEBUG "HBTE/E-BOOT: %zd bits of entropy added and credited\n", 8 * nbytes);
++        // Force CSPRNG initialization
++        crng_reseed(&primary_crng, NULL);
++}
++#endif /* CONFIG_HBTE */
++
+ /*
+  * Add device- or boot-specific data to the input pool to help
+  * initialize it.
+diff --git a/include/linux/random.h b/include/linux/random.h
+index 1f7dced2bba6..466d17626d79 100644
+--- a/include/linux/random.h
++++ b/include/linux/random.h
+@@ -12,12 +12,20 @@
+ 
+ #include <uapi/linux/random.h>
+ 
++#ifdef CONFIG_HBTE
++#include <asm/hbte.h>
++#endif
++
+ struct random_ready_callback {
+ 	struct list_head list;
+ 	void (*func)(struct random_ready_callback *rdy);
+ 	struct module *owner;
+ };
+ 
++#ifdef CONFIG_HBTE
++void add_boot_time_entropy(struct hbte_rnd *hbte_rnd);
++#endif
++
+ extern void add_device_randomness(const void *, unsigned int);
+ 
+ #if defined(LATENT_ENTROPY_PLUGIN) && !defined(__CHECKER__)
+diff --git a/init/main.c b/init/main.c
+index 96f8d5af52d6..5cff12289c10 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -100,6 +100,10 @@
+ #include <asm/sections.h>
+ #include <asm/cacheflush.h>
+ 
++#ifdef CONFIG_HBTE
++#include <asm/hbte.h>
++#endif
++
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/initcall.h>
+ 
+@@ -108,6 +112,16 @@ static int kernel_init(void *);
+ extern void init_IRQ(void);
+ extern void radix_tree_init(void);
+ 
++/*
++ * HBTE/E-BOOT pre-reserved area containing randomness filled by the hypervisor.
++ */
++#ifdef CONFIG_HBTE
++struct hbte_rnd hbte_rnd __section(.hbte.rnd) = {
++        .magic = HBTE_MAGIC_NUMBER,
++        .payload = {},
++};
++#endif
++
+ /*
+  * Debug helper: via this flag we know that we are in 'early bootup code'
+  * where only the boot processor is running with IRQ disabled.  This means
+@@ -690,6 +704,9 @@ asmlinkage __visible void __init start_kernel(void)
+ 	rand_initialize();
+ 	add_latent_entropy();
+ 	add_device_randomness(command_line, strlen(command_line));
++#ifdef CONFIG_HBTE
++        add_boot_time_entropy(&hbte_rnd);
++#endif
+ 	boot_init_stack_canary();
+ 
+ 	time_init();
